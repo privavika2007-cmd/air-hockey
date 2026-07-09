@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pygame
 
-from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck
+from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck, get_field_scene
 from network_client import GameClient
 
 pygame.init()
@@ -42,6 +42,12 @@ TEXT = (230, 230, 230)
 
 FONT = pygame.font.SysFont("arial", 18)
 FONT_SMALL = pygame.font.SysFont("arial", 14)
+GAME_HINT_SURF = FONT_SMALL.render(
+    "ESC — меню  |  мышь — стик  |  нужен сервер + 2 окна для матча",
+    True,
+    (120, 120, 120),
+)
+_status_surf_cache: dict[str, pygame.Surface] = {}
 
 PLAY_CENTER = (593, 515)
 PLAY_R = 74
@@ -106,6 +112,7 @@ STICK_GAP = 80
 
 _stick_sources = {}
 _sticker_cache = {}
+_field_stick_cache = {}
 _sound_note_icon = None
 
 SLIDER_RECT = pygame.Rect(930, 385, 220, 8)
@@ -398,10 +405,13 @@ def draw_stick_bar():
 
 
 def field_stick_surface(mode_name, stick_index, tf):
-    source = load_stick_source(mode_name, stick_index)
     diam = max(16, tf.radius_px(PLAYER_RADIUS) * 2)
-    scaled = pygame.transform.smoothscale(source, (diam, diam))
-    return _apply_circle_mask(scaled)
+    key = (mode_name, stick_index, diam)
+    if key not in _field_stick_cache:
+        source = load_stick_source(mode_name, stick_index)
+        scaled = pygame.transform.smoothscale(source, (diam, diam))
+        _field_stick_cache[key] = _apply_circle_mask(scaled)
+    return _field_stick_cache[key]
 
 
 def _apply_circle_mask(surf):
@@ -442,6 +452,7 @@ def start_game():
     state.field_transform = None
     state.player_stick_pos = (0.0, DOWN_WALL + PLAYER_RADIUS)
     state.game_status = "Подключение к серверу..."
+    _, state.field_transform, _ = get_field_scene((W, H))
     state.game_client = GameClient()
     state.game_client.start()
 
@@ -550,40 +561,49 @@ def update_volume_from_x(x):
 
 
 def draw_game_screen():
-    live = state.game_client.latest_state if state.game_client else None
-    live_score = live.score if live else None
+    client = state.game_client
+    connected = False
+    live = None
+    if client is not None:
+        connected, live, status, msgs = client.snapshot()
+        if msgs:
+            state.game_status = msgs[-1]
+        if status:
+            state.game_status = status
+
+    if live is not None:
+        live_score = live.score
+    elif connected:
+        live_score = (0, 0)
+    else:
+        live_score = None
 
     tf = draw_game_field(screen, (W, H), live_score=live_score)
     state.field_transform = tf
 
     update_player_stick_from_mouse(pygame.mouse.get_pos())
-    if state.game_client is not None:
-        state.game_client.set_position(state.player_stick_pos[0], state.player_stick_pos[1])
-        for msg in state.game_client.pop_messages():
-            state.game_status = msg
-        if state.game_client.status:
-            state.game_status = state.game_client.status
+    if client is not None:
+        client.set_position(state.player_stick_pos[0], state.player_stick_pos[1])
 
     my_stick = state.selected_stick if state.selected_stick is not None else 0
     opp_stick = 1 if my_stick == 0 else 0
 
     if live is not None:
-        draw_field_stick(tf, live.player1[0], live.player1[1], stick_index=my_stick)
+        draw_field_stick(tf, state.player_stick_pos[0], state.player_stick_pos[1], stick_index=my_stick)
         draw_field_stick(tf, live.player2[0], live.player2[1], stick_index=opp_stick)
         draw_puck(screen, tf, live.puck[0], live.puck[1])
     else:
         draw_field_stick(tf, state.player_stick_pos[0], state.player_stick_pos[1], stick_index=my_stick)
+        draw_puck(screen, tf, 0.0, 0.0)
 
     if state.game_status:
-        status = FONT_SMALL.render(state.game_status, True, (180, 220, 255))
-        screen.blit(status, (18, 12))
+        status_surf = _status_surf_cache.get(state.game_status)
+        if status_surf is None:
+            status_surf = FONT_SMALL.render(state.game_status, True, (180, 220, 255))
+            _status_surf_cache[state.game_status] = status_surf
+        screen.blit(status_surf, (18, 12))
 
-    hint = FONT_SMALL.render(
-        "ESC — меню  |  мышь — стик  |  нужен сервер + 2 окна для матча",
-        True,
-        (120, 120, 120),
-    )
-    screen.blit(hint, (18, H - 26))
+    screen.blit(GAME_HINT_SURF, (18, H - 26))
     pygame.display.flip()
 
 

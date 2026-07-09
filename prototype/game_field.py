@@ -29,7 +29,10 @@ NEON_VELOCITY_FIELD_FILE = "neon_velocity_field.png"
 NEON_MOCKUP_SIZE = (703, 1024)
 # Координаты игры — вся площадь внутри cyan-борта (включая зону у табло и ворот).
 NEON_COORD_NORM = (58 / 703, 58 / 1024, 613 / 703, 908 / 1024)
-NEON_SCORE_NORM = (584 / 703, 58 / 1024, 82 / 703, 908 / 1024)
+# Счётные панели (скруглённые квадраты справа) — внутри neon-обводки, мокап 703×1024.
+NEON_SCORE_TOP_PANEL_NORM = (575 / 703, 80 / 1024, 86 / 703, 417 / 1024)
+NEON_SCORE_BOTTOM_PANEL_NORM = (575 / 703, 520 / 1024, 86 / 703, 429 / 1024)
+SCORE_PANEL_RADIUS_FRAC = 0.14
 
 NEON_THEME = {
     "background": (0, 0, 0),
@@ -37,6 +40,11 @@ NEON_THEME = {
 }
 
 _neon_field_image: pygame.Surface | None = None
+_field_bg_cache: dict[tuple[int, int], tuple[pygame.Surface, pygame.Rect]] = {}
+_field_scene_cache: dict[tuple[int, int], tuple[pygame.Surface, "FieldTransform", tuple[pygame.Rect, pygame.Rect]]] = {}
+_score_overlay_cache: dict[tuple[int, int, int, int], pygame.Surface] = {}
+_score_font_cache: dict[int, pygame.font.Font] = {}
+_puck_surface_cache: dict[int, pygame.Surface] = {}
 
 
 def _load_neon_field_image() -> pygame.Surface:
@@ -58,6 +66,38 @@ def _fit_image_on_screen(surf: pygame.Surface, image: pygame.Surface) -> pygame.
     return rect
 
 
+def _score_panel_rects(dest: pygame.Rect) -> tuple[pygame.Rect, pygame.Rect]:
+    """Верхняя и нижняя счётные панели на мокапе (соперник / я)."""
+    top = _norm_rect(dest, NEON_SCORE_TOP_PANEL_NORM)
+    bottom = _norm_rect(dest, NEON_SCORE_BOTTOM_PANEL_NORM)
+    return top, bottom
+
+
+def _score_font(cell_rect: pygame.Rect, value: int) -> pygame.font.Font:
+    digits = len(str(value))
+    base = min(cell_rect.w, cell_rect.h) * (0.48 if digits == 1 else 0.36)
+    size = max(18, int(base))
+    font = _score_font_cache.get(size)
+    if font is None:
+        font = pygame.font.SysFont("arial", size, bold=True)
+        _score_font_cache[size] = font
+    return font
+
+
+def _draw_score_in_panel(surf: pygame.Surface, panel: pygame.Rect, value: int) -> None:
+    """Закрывает «0» на мокапе и рисует счёт по центру скруглённой панели."""
+    radius = max(6, int(min(panel.w, panel.h) * SCORE_PANEL_RADIUS_FRAC))
+    patch = pygame.Surface((panel.w, panel.h), pygame.SRCALPHA)
+    pygame.draw.rect(patch, (0, 0, 0, 235), patch.get_rect(), border_radius=radius)
+    surf.blit(patch, panel.topleft)
+
+    text = _score_font(panel, value).render(str(value), True, NEON_THEME["score_text"])
+    surf.blit(
+        text,
+        (panel.centerx - text.get_width() // 2, panel.centery - text.get_height() // 2),
+    )
+
+
 def _norm_rect(dest: pygame.Rect, norm: tuple[float, float, float, float]) -> pygame.Rect:
     nx, ny, nw, nh = norm
     return pygame.Rect(
@@ -68,55 +108,35 @@ def _norm_rect(dest: pygame.Rect, norm: tuple[float, float, float, float]) -> py
     )
 
 
-def _resolve_circle_rect(sx: float, sy: float, rad: float, rect: pygame.Rect) -> tuple[float, float]:
-    """Выталкивает круг из прямоугольника (обводка табло), если он заехал внутрь."""
-    if not rect.collidepoint(sx, sy):
-        nearest_x = max(rect.left, min(sx, rect.right))
-        nearest_y = max(rect.top, min(sy, rect.bottom))
-        dx = sx - nearest_x
-        dy = sy - nearest_y
-        if dx * dx + dy * dy >= rad * rad:
-            return sx, sy
+def _field_background(screen_size: tuple[int, int]) -> tuple[pygame.Surface, pygame.Rect]:
+    cached = _field_bg_cache.get(screen_size)
+    if cached is not None:
+        return cached
 
-    # Ближайшая точка снаружи rect для центра круга.
-    if sx < rect.left:
-        sx = rect.left - rad
-    elif sx > rect.right:
-        sx = rect.right + rad
-    elif sy < rect.top:
-        sy = rect.top - rad
-    elif sy > rect.bottom:
-        sy = rect.bottom + rad
-    else:
-        # Центр внутри — выталкиваем в ближайшую сторону.
-        dist_left = sx - rect.left
-        dist_right = rect.right - sx
-        dist_top = sy - rect.top
-        dist_bottom = rect.bottom - sy
-        best = min(
-            (dist_left, "left"),
-            (dist_right, "right"),
-            (dist_top, "top"),
-            (dist_bottom, "bottom"),
-            key=lambda item: item[0],
-        )
-        if best[1] == "left":
-            sx = rect.left - rad
-        elif best[1] == "right":
-            sx = rect.right + rad
-        elif best[1] == "top":
-            sy = rect.top - rad
-        else:
-            sy = rect.bottom + rad
-    return sx, sy
+    mockup = _load_neon_field_image()
+    sw, sh = screen_size
+    iw, ih = mockup.get_size()
+    scale = min(sw / iw, sh / ih)
+    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    scaled = pygame.transform.smoothscale(mockup, (nw, nh))
+    bg = pygame.Surface(screen_size)
+    bg.fill((0, 0, 0))
+    dest_rect = scaled.get_rect(center=(sw // 2, sh // 2))
+    bg.blit(scaled, dest_rect)
+    _field_bg_cache[screen_size] = (bg, dest_rect)
+    return bg, dest_rect
 
 
 class FieldTransform:
     """Игровые координаты → пиксели. Игрок 1 (я) — снизу (отрицательный Y)."""
 
-    def __init__(self, field_rect: pygame.Rect, score_box_rect: pygame.Rect):
+    def __init__(
+        self,
+        field_rect: pygame.Rect,
+        score_panel_rects: tuple[pygame.Rect, pygame.Rect],
+    ):
         self.field_rect = field_rect
-        self.score_box_rect = score_box_rect
+        self.score_panel_rects = score_panel_rects
         self.scale = field_rect.width / FIELD_W
         self.origin_x = field_rect.centerx
         self.origin_y = field_rect.centery
@@ -132,25 +152,16 @@ class FieldTransform:
         return gx, gy
 
     def clamp_player1(self, gx: float, gy: float) -> tuple[float, float]:
-        """
-        Нижняя половина: бортики, центральная линия, обводка табло (не внутрь цифр).
-        Можно ходить у ворот, под табло и по всей своей половине.
-        """
+        """Нижняя половина: только бортики и центральная линия (табло не блокирует)."""
         r = PLAYER_RADIUS
         gx = max(LEFT_WALL + r, min(RIGHT_WALL - r, gx))
         gy = max(DOWN_WALL + r, min(-r, gy))
 
         rad = self.radius_px(r)
         rink = self.field_rect
-        sb = self.score_box_rect
         sx, sy = self.to_screen(gx, gy)
-
-        # Бортики и центральная линия.
         sx = max(rink.left + rad, min(rink.right - rad, sx))
         sy = max(self.to_screen(0, -r)[1], min(rink.bottom - rad, sy))
-
-        # Обводка табло — нельзя заезжать на цифры, но можно под табло у правого борта.
-        sx, sy = _resolve_circle_rect(sx, sy, rad, sb)
 
         gx, gy = self.to_game(sx, sy)
         gx = max(LEFT_WALL + r, min(RIGHT_WALL - r, gx))
@@ -163,32 +174,59 @@ class FieldTransform:
 
 def draw_score_values(
     surf: pygame.Surface,
-    score_box_rect: pygame.Rect,
+    score_panel_rects: tuple[pygame.Rect, pygame.Rect],
     score_first: int,
     score_second: int,
 ) -> None:
     """score_first — мой счёт (низ), score_second — соперник (верх)."""
-    cover = pygame.Surface((score_box_rect.w, score_box_rect.h), pygame.SRCALPHA)
-    cover.fill((0, 0, 0, 180))
-    surf.blit(cover, score_box_rect.topleft)
+    top_panel, bottom_panel = score_panel_rects
+    _draw_score_in_panel(surf, top_panel, score_second)
+    _draw_score_in_panel(surf, bottom_panel, score_first)
 
-    font = pygame.font.SysFont("arial", max(24, score_box_rect.w // 2), bold=True)
-    color = NEON_THEME["score_text"]
 
-    top_y = score_box_rect.top + score_box_rect.height // 4
-    bot_y = score_box_rect.top + 3 * score_box_rect.height // 4
-    cx = score_box_rect.centerx
+def get_field_scene(
+    screen_size: tuple[int, int],
+) -> tuple[pygame.Surface, FieldTransform, tuple[pygame.Rect, pygame.Rect]]:
+    """Кэш фона и FieldTransform — не пересчитываем каждый кадр."""
+    cached = _field_scene_cache.get(screen_size)
+    if cached is not None:
+        return cached
 
-    for value, y in ((score_second, top_y), (score_first, bot_y)):
-        text = font.render(str(value), True, color)
-        surf.blit(text, (cx - text.get_width() // 2, y - text.get_height() // 2))
+    bg, dest_rect = _field_background(screen_size)
+    play_rect = _norm_rect(dest_rect, NEON_COORD_NORM)
+    score_panel_rects = _score_panel_rects(dest_rect)
+    tf = FieldTransform(play_rect, score_panel_rects)
+    scene = (bg, tf, score_panel_rects)
+    _field_scene_cache[screen_size] = scene
+    return scene
+
+
+def _score_overlay(
+    screen_size: tuple[int, int],
+    score_panel_rects: tuple[pygame.Rect, pygame.Rect],
+    live_score: tuple[int, int],
+) -> pygame.Surface:
+    key = (screen_size[0], screen_size[1], live_score[0], live_score[1])
+    overlay = _score_overlay_cache.get(key)
+    if overlay is None:
+        overlay = pygame.Surface(screen_size, pygame.SRCALPHA)
+        draw_score_values(overlay, score_panel_rects, live_score[0], live_score[1])
+        _score_overlay_cache[key] = overlay
+    return overlay
 
 
 def draw_puck(surf: pygame.Surface, tf: "FieldTransform", gx: float, gy: float) -> None:
-    center = tf.to_screen(gx, gy)
     radius = tf.radius_px(PUCK_RADIUS)
-    pygame.draw.circle(surf, (80, 255, 120), center, radius)
-    pygame.draw.circle(surf, (200, 255, 220), center, max(1, radius // 3))
+    puck_surf = _puck_surface_cache.get(radius)
+    if puck_surf is None:
+        size = radius * 2 + 2
+        puck_surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        center = (size // 2, size // 2)
+        pygame.draw.circle(puck_surf, (80, 255, 120), center, radius)
+        pygame.draw.circle(puck_surf, (200, 255, 220), center, max(1, radius // 3))
+        _puck_surface_cache[radius] = puck_surf
+    center = tf.to_screen(gx, gy)
+    surf.blit(puck_surf, puck_surf.get_rect(center=center))
 
 
 def draw_game_field(
@@ -197,16 +235,9 @@ def draw_game_field(
     theme: dict | None = None,
     live_score: tuple[int, int] | None = None,
 ):
-    """Neon Velocity — фон и табло строго из мокапа. live_score — для будущего обновления с сервера."""
-    theme = theme or NEON_THEME
-    mockup = _load_neon_field_image()
-    dest_rect = _fit_image_on_screen(surf, mockup)
-
-    play_rect = _norm_rect(dest_rect, NEON_COORD_NORM)
-    score_rect = _norm_rect(dest_rect, NEON_SCORE_NORM)
-    tf = FieldTransform(play_rect, score_rect)
-
+    """Neon Velocity — фон и табло строго из мокапа."""
+    bg, tf, score_panel_rects = get_field_scene(screen_size)
+    surf.blit(bg, (0, 0))
     if live_score is not None:
-        draw_score_values(surf, score_rect, live_score[0], live_score[1])
-
+        surf.blit(_score_overlay(screen_size, score_panel_rects, live_score), (0, 0))
     return tf

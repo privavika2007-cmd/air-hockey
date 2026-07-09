@@ -7,10 +7,10 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from dataclasses import dataclass
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws_connect"
 SEND_INTERVAL = 1.0 / 60.0
@@ -82,6 +82,16 @@ class GameClient:
             self._pending_messages.clear()
             return msgs
 
+    def snapshot(self) -> tuple[bool, ClientGameState | None, str, list[str]]:
+        """Один lock на кадр — меньше подёргиваний от сетевого потока."""
+        with self._lock:
+            live = self.latest_state
+            if live is not None:
+                live = ClientGameState(live.player1, live.player2, live.puck, live.score)
+            msgs = self._pending_messages[:]
+            self._pending_messages.clear()
+            return self.connected, live, self.status, msgs
+
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -94,9 +104,14 @@ class GameClient:
     async def _run(self) -> None:
         while self._running:
             try:
-                async with websockets.connect(self.url, open_timeout=3) as ws:
+                async with websockets.connect(
+                    self.url,
+                    open_timeout=5,
+                    close_timeout=2,
+                ) as ws:
                     with self._lock:
                         self.connected = True
+                        self.latest_state = None
                         self.status = "Ждём второго игрока..."
                     send_task = asyncio.create_task(self._send_loop(ws))
                     try:
@@ -112,20 +127,35 @@ class GameClient:
                             pass
             except asyncio.CancelledError:
                 break
+            except ConnectionClosed:
+                with self._lock:
+                    self.connected = False
+                    self.latest_state = None
+                    self.status = "Сервер занят (2 игрока). Перезапустите сервер или закройте лишние окна"
+            except OSError:
+                with self._lock:
+                    self.connected = False
+                    self.latest_state = None
+                    self.status = "Сервер не запущен — см. терминал с uvicorn"
             except Exception as exc:
                 with self._lock:
                     self.connected = False
                     self.latest_state = None
                     self.status = f"Нет связи с сервером ({exc.__class__.__name__})"
-                if self._running:
-                    await asyncio.sleep(2.0)
+            else:
+                continue
+            if self._running:
+                await asyncio.sleep(2.0)
 
     async def _send_loop(self, ws) -> None:
-        while self._running:
-            with self._lock:
-                x, y = self._position
-            await ws.send(json.dumps({"position": {"x": x, "y": y}}))
-            await asyncio.sleep(SEND_INTERVAL)
+        try:
+            while self._running:
+                with self._lock:
+                    x, y = self._position
+                await ws.send(json.dumps({"position": {"x": x, "y": y}}))
+                await asyncio.sleep(SEND_INTERVAL)
+        except (ConnectionClosed, asyncio.CancelledError):
+            pass
 
     def _handle_message(self, packet: dict) -> None:
         msg_type = packet.get("type")
