@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from dataclasses import dataclass
 
 import websockets
@@ -28,6 +29,7 @@ class ClientGameState:
     player1_vector: tuple[float, float] = (0.0, 0.0)
     player2_speed: float = 0.0
     player2_vector: tuple[float, float] = (0.0, 0.0)
+    sent_at: float | None = None
 
 
 def _parse_position(obj: dict) -> tuple[float, float]:
@@ -38,6 +40,16 @@ def _parse_position(obj: dict) -> tuple[float, float]:
 def _parse_vector(obj: dict) -> tuple[float, float]:
     sv = obj.get("speed_vector", {})
     return float(sv.get("first", 0) or 0), float(sv.get("second", 0) or 0)
+
+
+def _parse_sent_at(data: dict) -> float | None:
+    raw = data.get("sent_at")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_game_state(data: dict) -> ClientGameState:
@@ -55,7 +67,15 @@ def _parse_game_state(data: dict) -> ClientGameState:
         player1_vector=_parse_vector(player1),
         player2_speed=float(player2.get("speed", 0) or 0),
         player2_vector=_parse_vector(player2),
+        sent_at=_parse_sent_at(data),
     )
+
+
+def packet_render_latency_ms(state: ClientGameState | None) -> float | None:
+    """Время от отправки GameState сервером до текущего момента (отрисовка)."""
+    if state is None or state.sent_at is None:
+        return None
+    return max(0.0, (time.time() - state.sent_at) * 1000.0)
 
 
 class GameClient:
@@ -129,6 +149,7 @@ class GameClient:
                     live.player1_vector,
                     live.player2_speed,
                     live.player2_vector,
+                    live.sent_at,
                 )
             states = self._state_queue[:]
             self._state_queue.clear()

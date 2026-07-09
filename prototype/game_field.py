@@ -419,6 +419,19 @@ def draw_puck(
     surf.blit(puck_surf, puck_surf.get_rect(center=center))
 
 
+def draw_puck_from_server(
+    surf: pygame.Surface,
+    tf: FieldTransform,
+    server_state,
+    mode_name: str | None = None,
+) -> bool:
+    """Рисует шайбу только из GameState с сервера. Локальной позиции нет."""
+    if server_state is None:
+        return False
+    draw_puck(surf, tf, server_state.puck[0], server_state.puck[1], mode_name=mode_name)
+    return True
+
+
 def warm_game_assets(
     screen_size: tuple[int, int],
     mode_name: str | None = None,

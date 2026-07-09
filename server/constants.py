@@ -71,7 +71,8 @@ sends to players:
         "score": {
             "first": 2,
             "second": 3
-        }
+        },
+        "sent_at": 1750000000.123
     }
 }
 

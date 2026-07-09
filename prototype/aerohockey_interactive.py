@@ -17,9 +17,9 @@ from pathlib import Path
 import pygame
 
 from game_effects import GameEffects
-from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck, warm_game_assets
+from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck_from_server, warm_game_assets
 from game_music import GameMusic
-from network_client import GameClient
+from network_client import GameClient, packet_render_latency_ms
 
 pygame.init()
 pygame.font.init()
@@ -51,6 +51,7 @@ GAME_HINT_SURF = FONT_SMALL.render(
     (120, 120, 120),
 )
 _status_surf_cache: dict[str, pygame.Surface] = {}
+_ping_surf_cache: dict[int, pygame.Surface] = {}
 game_effects = GameEffects()
 game_music = GameMusic()
 game_effects._load_stickers()
@@ -662,13 +663,21 @@ def draw_game_screen():
     if live is not None:
         draw_field_stick(tf, state.player_stick_pos[0], state.player_stick_pos[1], stick_index=my_stick)
         draw_field_stick(tf, live.player2[0], live.player2[1], stick_index=opp_stick)
-        draw_puck(screen, tf, live.puck[0], live.puck[1], mode_name=mode)
+        draw_puck_from_server(screen, tf, live, mode_name=mode)
     else:
         draw_field_stick(tf, state.player_stick_pos[0], state.player_stick_pos[1], stick_index=my_stick)
-        draw_puck(screen, tf, 0.0, 0.0, mode_name=mode)
 
     game_effects.draw_goal_flash(screen, tf, mode_name=mode)
     game_effects.draw_result_overlay(screen, tf)
+
+    ping_ms = packet_render_latency_ms(live)
+    if ping_ms is not None:
+        ping_key = int(round(ping_ms))
+        ping_surf = _ping_surf_cache.get(ping_key)
+        if ping_surf is None:
+            ping_surf = FONT_SMALL.render(f"Ping: {ping_key} ms", True, (140, 255, 180))
+            _ping_surf_cache[ping_key] = ping_surf
+        screen.blit(ping_surf, (W - ping_surf.get_width() - 18, 12))
 
     if state.game_status:
         status_surf = _status_surf_cache.get(state.game_status)

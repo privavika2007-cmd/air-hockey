@@ -4,6 +4,7 @@ from enum import IntEnum, StrEnum
 from constants import *
 from collections import deque
 import asyncio
+import time
 
 from physics_engine import calculate_player_puck_collision, calculate_player_wall_collision, calculate_puck_wall_collision, checking_goal
 from models import Pair, Player, Puck, GoalStatus
@@ -341,10 +342,13 @@ class GameMaster():
                     #например - message, error, GameState, GoalStatus
 
                #send packets here
+               sent_at = time.time()
+               player1_data = asdict(self.gamestate)
+               player1_data["sent_at"] = sent_at
                await self.masterLink.wsHandler.send_to_player1(
                     Packet(
                          type= PacketType.GAME_STATE,
-                         data= asdict(self.gamestate)
+                         data= player1_data
                     )
                     ) #player 1
 
@@ -371,10 +375,12 @@ class GameMaster():
                     )
                )
 
+               player2_data = asdict(gamestate_copy_reversed)
+               player2_data["sent_at"] = sent_at
                await self.masterLink.wsHandler.send_to_player2(
                     Packet(
                          type= PacketType.GAME_STATE,
-                         data= asdict(gamestate_copy_reversed)
+                         data= player2_data
                     )
                     )
           
