@@ -16,11 +16,14 @@ from pathlib import Path
 
 import pygame
 
-from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck, get_field_scene
+from game_effects import GameEffects
+from game_field import DOWN_WALL, PLAYER_RADIUS, draw_game_field, draw_puck, warm_game_assets
+from game_music import GameMusic
 from network_client import GameClient
 
 pygame.init()
 pygame.font.init()
+pygame.mixer.init()
 
 W, H = 1186, 670
 screen = pygame.display.set_mode((W, H))
@@ -48,6 +51,9 @@ GAME_HINT_SURF = FONT_SMALL.render(
     (120, 120, 120),
 )
 _status_surf_cache: dict[str, pygame.Surface] = {}
+game_effects = GameEffects()
+game_music = GameMusic()
+game_effects._load_stickers()
 
 PLAY_CENTER = (593, 515)
 PLAY_R = 74
@@ -114,6 +120,10 @@ _stick_sources = {}
 _sticker_cache = {}
 _field_stick_cache = {}
 _sound_note_icon = None
+_splash_logo = None
+
+SPLASH_LOGO_MAX_H = 260
+SPLASH_LOGO_GAP = 20
 
 SLIDER_RECT = pygame.Rect(930, 385, 220, 8)
 SLIDER_TRACK_H = 8
@@ -155,6 +165,28 @@ def sound_note_icon():
     if _sound_note_icon is None:
         _sound_note_icon = pygame.image.load(str(ICONS_DIR / "sound_note.png")).convert_alpha()
     return _sound_note_icon
+
+
+def splash_logo():
+    global _splash_logo
+    if _splash_logo is None:
+        _splash_logo = pygame.image.load(str(ASSETS_DIR / "splash_logo.png")).convert_alpha()
+    return _splash_logo
+
+
+def draw_splash_logo():
+    img = splash_logo()
+    src_w, src_h = img.get_size()
+    play_top_with_glow = PLAY_CENTER[1] - PLAY_R - 34
+    max_h = play_top_with_glow - SPLASH_LOGO_GAP - 24
+    display_h = min(SPLASH_LOGO_MAX_H, max_h)
+    if display_h < 40:
+        return
+    scale = display_h / src_h
+    display_w = max(1, int(src_w * scale))
+    scaled = pygame.transform.smoothscale(img, (display_w, display_h))
+    rect = scaled.get_rect(midbottom=(PLAY_CENTER[0], play_top_with_glow - SPLASH_LOGO_GAP))
+    screen.blit(scaled, rect)
 
 
 def blit_image_icon_with_shadow(surf, center, image, height=40, shadow_offset=(3, 4)):
@@ -294,6 +326,21 @@ def current_mode_index():
 
 def current_mode_name():
     return MODES[current_mode_index()]
+
+
+def is_first_to_five_mode() -> bool:
+    idx = state.selected_score
+    if idx is None:
+        return True
+    return SCORE_OPTIONS[idx][0] == "to5"
+
+
+def should_show_match_result() -> bool:
+    """Стикеры победы/поражения — только в режиме First To Five."""
+    idx = state.selected_score
+    if idx is None:
+        return False
+    return SCORE_OPTIONS[idx][0] == "to5"
 
 
 def trim_stick_image(surf):
@@ -440,6 +487,8 @@ def stop_game():
     state.screen = "splash"
     state.field_transform = None
     state.game_status = ""
+    game_effects.reset()
+    game_music.stop()
 
 
 def start_game():
@@ -453,9 +502,12 @@ def start_game():
     state.player_stick_pos = (0.0, DOWN_WALL + PLAYER_RADIUS)
     state.game_status = "Подключение к серверу..."
     mode = current_mode_name()
-    _, state.field_transform, _ = get_field_scene((W, H), mode)
+    state.field_transform = warm_game_assets((W, H), mode)
     state.game_client = GameClient()
     state.game_client.start()
+    game_effects.reset()
+    game_effects.warm_up()
+    game_music.play_mode(mode, state.volume)
 
 
 def update_player_stick_from_mouse(pos):
@@ -507,7 +559,7 @@ def handle_click(pos):
         return
 
     if in_circle(pos, PLAY_CENTER, PLAY_R):
-        if state.selected_stick is not None:
+        if state.selected_stick is not None and state.selected_score is not None:
             start_game()
             state.play_flash_frames = 12
             return
@@ -559,25 +611,42 @@ def handle_click(pos):
 def update_volume_from_x(x):
     t = (x - SLIDER_RECT.x) / SLIDER_RECT.width
     state.volume = max(0.0, min(1.0, t))
+    game_music.set_volume(state.volume)
 
 
 def draw_game_screen():
     client = state.game_client
     connected = False
     live = None
+    msgs: list[str] = []
+    state_steps: list = []
+    persisted_score = None
     if client is not None:
-        connected, live, status, msgs = client.snapshot()
+        connected, live, status, msgs, state_steps, persisted_score = client.snapshot()
         if msgs:
             state.game_status = msgs[-1]
         if status:
             state.game_status = status
+            if "max_score" in status.lower():
+                msgs = list(msgs) + [status]
 
     if live is not None:
         live_score = live.score
+    elif persisted_score is not None:
+        live_score = persisted_score
     elif connected:
         live_score = (0, 0)
     else:
         live_score = None
+
+    game_effects.tick(
+        live,
+        state_steps,
+        msgs,
+        state.volume,
+        first_to_five=should_show_match_result(),
+        persisted_score=persisted_score,
+    )
 
     mode = current_mode_name()
     tf = draw_game_field(screen, (W, H), mode_name=mode, live_score=live_score)
@@ -598,6 +667,9 @@ def draw_game_screen():
         draw_field_stick(tf, state.player_stick_pos[0], state.player_stick_pos[1], stick_index=my_stick)
         draw_puck(screen, tf, 0.0, 0.0, mode_name=mode)
 
+    game_effects.draw_goal_flash(screen, tf, mode_name=mode)
+    game_effects.draw_result_overlay(screen, tf)
+
     if state.game_status:
         status_surf = _status_surf_cache.get(state.game_status)
         if status_surf is None:
@@ -615,6 +687,7 @@ def draw():
         return
 
     screen.fill(BLACK)
+    draw_splash_logo()
 
     play_color = TEAL_HOVER if state.play_flash_frames > 0 else TEAL
     draw_glow_circle(screen, PLAY_CENTER, PLAY_R, play_color, CYAN)
@@ -672,4 +745,5 @@ while running:
 pygame.quit()
 if state.game_client is not None:
     state.game_client.stop()
+game_music.stop()
 print("Окно закрыто.")

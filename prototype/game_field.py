@@ -26,14 +26,37 @@ FIELD_H = TOP_WALL - DOWN_WALL
 FIELDS_DIR = Path(__file__).resolve().parent.parent / "images" / "fields"
 PUCKS_DIR = Path(__file__).resolve().parent.parent / "images" / "pucks"
 
-# Мокапы полей 682×1024 — одни координаты для Neon Velocity и Cosmic Rink.
+# Мокапы полей — общая геометрия игры (682×1024 эталон; Sprinkle 696×1024 — те же доли).
 MOCKUP_SIZE = (682, 1024)
 PLAY_COORD_NORM = (56 / 682, 56 / 1024, 601 / 682, 916 / 1024)
-SCORE_TOP_PANEL_NORM = (540 / 682, 80 / 1024, 83 / 682, 417 / 1024)
-SCORE_BOTTOM_PANEL_NORM = (540 / 682, 520 / 1024, 83 / 682, 429 / 1024)
-SCORE_TEXT_COLOR = (47, 208, 255)
+SCORE_PANEL_W_NORM = 83 / 682
+# X панели счёта подогнан под правый борт каждого мокапа (34px от борта до правого края цифр).
+SCORE_PANEL_X_NORMS: dict[str, float] = {
+    "Neon Velocity": 540 / 682,
+    "Cosmic Rink": 541 / 682,
+    "Sprinkle Slam": 564 / 682,
+}
+# Горизонталь вспышки ворот на мокапах: (x_left, width) в долях play_rect; высота фикс.
+GOAL_FLASH_WIDTH_NORMS: dict[str, dict[str, tuple[float, float]]] = {
+    "Neon Velocity": {
+        "top": (0.2063, 0.5308),
+        "bottom": (0.2146, 0.5208),
+    },
+    "Cosmic Rink": {
+        "top": (0.2146, 0.5108),
+        "bottom": (0.2163, 0.5092),
+    },
+    "Sprinkle Slam": {
+        "top": (0.1997, 0.5491),
+        "bottom": (0.1963, 0.5557),
+    },
+}
+GOAL_FLASH_HEIGHT_FRAC = 0.048
 
 DEFAULT_MODE = "Neon Velocity"
+NEON_SCORE_COLOR = (47, 208, 255)
+COSMIC_SCORE_COLOR = (180, 90, 255)
+SPRINKLE_SCORE_COLOR = (255, 120, 200)
 
 
 @dataclass(frozen=True)
@@ -41,6 +64,7 @@ class FieldTheme:
     field_file: str
     puck_file: str
     puck_visible_diam_frac: float
+    score_text_color: tuple[int, int, int] = NEON_SCORE_COLOR
 
 
 FIELD_THEMES: dict[str, FieldTheme] = {
@@ -48,11 +72,19 @@ FIELD_THEMES: dict[str, FieldTheme] = {
         field_file="neon_velocity_field.png",
         puck_file="neon_velocity_puck.png",
         puck_visible_diam_frac=451 / 1024,
+        score_text_color=NEON_SCORE_COLOR,
     ),
     "Cosmic Rink": FieldTheme(
         field_file="cosmic_rink_field.png",
         puck_file="cosmic_rink_moon.png",
         puck_visible_diam_frac=297 / 360,
+        score_text_color=COSMIC_SCORE_COLOR,
+    ),
+    "Sprinkle Slam": FieldTheme(
+        field_file="sprinkle_slam_field.png",
+        puck_file="sprinkle_slam_pancake.png",
+        puck_visible_diam_frac=651 / 980,
+        score_text_color=SPRINKLE_SCORE_COLOR,
     ),
 }
 
@@ -110,9 +142,16 @@ def _load_puck_image(theme: FieldTheme) -> pygame.Surface:
     return cached
 
 
-def _score_panel_rects(dest: pygame.Rect) -> tuple[pygame.Rect, pygame.Rect]:
-    top = _norm_rect(dest, SCORE_TOP_PANEL_NORM)
-    bottom = _norm_rect(dest, SCORE_BOTTOM_PANEL_NORM)
+def _score_panel_x_norm(mode_name: str | None) -> float:
+    if mode_name and mode_name in SCORE_PANEL_X_NORMS:
+        return SCORE_PANEL_X_NORMS[mode_name]
+    return SCORE_PANEL_X_NORMS["Neon Velocity"]
+
+
+def _score_panel_rects(dest: pygame.Rect, mode_name: str | None = None) -> tuple[pygame.Rect, pygame.Rect]:
+    x_norm = _score_panel_x_norm(mode_name)
+    top = _norm_rect(dest, (x_norm, 80 / 1024, SCORE_PANEL_W_NORM, 417 / 1024))
+    bottom = _norm_rect(dest, (x_norm, 520 / 1024, SCORE_PANEL_W_NORM, 429 / 1024))
     return top, bottom
 
 
@@ -175,8 +214,13 @@ def _draw_digital_number(
                 _draw_neon_segment(surf, seg.move(origin_x, start_y), color)
 
 
-def _draw_score_in_panel(surf: pygame.Surface, panel: pygame.Rect, value: int) -> None:
-    _draw_digital_number(surf, panel, value, SCORE_TEXT_COLOR)
+def _draw_score_in_panel(
+    surf: pygame.Surface,
+    panel: pygame.Rect,
+    value: int,
+    color: tuple[int, int, int],
+) -> None:
+    _draw_digital_number(surf, panel, value, color)
 
 
 def _norm_rect(dest: pygame.Rect, norm: tuple[float, float, float, float]) -> pygame.Rect:
@@ -219,8 +263,10 @@ class FieldTransform:
         self,
         field_rect: pygame.Rect,
         score_panel_rects: tuple[pygame.Rect, pygame.Rect],
+        mockup_rect: pygame.Rect | None = None,
     ):
         self.field_rect = field_rect
+        self.mockup_rect = mockup_rect if mockup_rect is not None else field_rect
         self.score_panel_rects = score_panel_rects
         self.scale = field_rect.width / FIELD_W
         self.origin_x = field_rect.centerx
@@ -256,16 +302,43 @@ class FieldTransform:
     def radius_px(self, game_radius: float) -> int:
         return max(1, int(round(game_radius * self.scale)))
 
+    def field_overlay_rect(self) -> pygame.Rect:
+        """Видимое поле на экране (мокап) — для оверлеев по центру картинки."""
+        return self.mockup_rect
+
+    def field_overlay_center(self) -> tuple[int, int]:
+        return self.mockup_rect.center
+
+
+def goal_flash_rect(
+    tf: FieldTransform,
+    mode_name: str | None,
+    target: str,
+) -> pygame.Rect:
+    """Вспышка вплотную к краю поля: зелёная — вверх, красная — вниз."""
+    theme_name = mode_name if mode_name in GOAL_FLASH_WIDTH_NORMS else DEFAULT_MODE
+    nx, nw = GOAL_FLASH_WIDTH_NORMS[theme_name][target]
+    rink = tf.field_rect
+    width = max(8, int(nw * rink.width))
+    height = max(6, int(GOAL_FLASH_HEIGHT_FRAC * rink.height))
+    left = int(rink.x + nx * rink.width)
+    if target == "top":
+        top = rink.top
+    else:
+        top = rink.bottom - height
+    return pygame.Rect(left, top, width, height)
+
 
 def draw_score_values(
     surf: pygame.Surface,
     score_panel_rects: tuple[pygame.Rect, pygame.Rect],
     score_first: int,
     score_second: int,
+    score_text_color: tuple[int, int, int],
 ) -> None:
     top_panel, bottom_panel = score_panel_rects
-    _draw_score_in_panel(surf, top_panel, score_second)
-    _draw_score_in_panel(surf, bottom_panel, score_first)
+    _draw_score_in_panel(surf, top_panel, score_second, score_text_color)
+    _draw_score_in_panel(surf, bottom_panel, score_first, score_text_color)
 
 
 def get_field_scene(
@@ -280,8 +353,8 @@ def get_field_scene(
 
     bg, dest_rect = _field_background(screen_size, theme)
     play_rect = _norm_rect(dest_rect, PLAY_COORD_NORM)
-    score_panel_rects = _score_panel_rects(dest_rect)
-    tf = FieldTransform(play_rect, score_panel_rects)
+    score_panel_rects = _score_panel_rects(dest_rect, mode_name)
+    tf = FieldTransform(play_rect, score_panel_rects, mockup_rect=dest_rect)
     scene = (bg, tf, score_panel_rects)
     _field_scene_cache[key] = scene
     return scene
@@ -298,7 +371,13 @@ def _score_overlay(
     overlay = _score_overlay_cache.get(key)
     if overlay is None:
         overlay = pygame.Surface(screen_size, pygame.SRCALPHA)
-        draw_score_values(overlay, score_panel_rects, live_score[0], live_score[1])
+        draw_score_values(
+            overlay,
+            score_panel_rects,
+            live_score[0],
+            live_score[1],
+            theme.score_text_color,
+        )
         _score_overlay_cache[key] = overlay
     return overlay
 
@@ -338,6 +417,17 @@ def draw_puck(
     puck_surf = _puck_surface(theme, radius)
     center = tf.to_screen(gx, gy)
     surf.blit(puck_surf, puck_surf.get_rect(center=center))
+
+
+def warm_game_assets(
+    screen_size: tuple[int, int],
+    mode_name: str | None = None,
+) -> FieldTransform:
+    """Прогрев кэша фона и шайбы при старте матча — меньше лагов в первые секунды."""
+    _, tf, _ = get_field_scene(screen_size, mode_name)
+    theme = get_theme(mode_name)
+    _puck_surface(theme, tf.radius_px(PUCK_RADIUS))
+    return tf
 
 
 def draw_game_field(

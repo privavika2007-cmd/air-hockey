@@ -22,6 +22,12 @@ class ClientGameState:
     player2: tuple[float, float]
     puck: tuple[float, float]
     score: tuple[int, int]
+    puck_speed: float = 0.0
+    puck_vector: tuple[float, float] = (0.0, 0.0)
+    player1_speed: float = 0.0
+    player1_vector: tuple[float, float] = (0.0, 0.0)
+    player2_speed: float = 0.0
+    player2_vector: tuple[float, float] = (0.0, 0.0)
 
 
 def _parse_position(obj: dict) -> tuple[float, float]:
@@ -29,12 +35,26 @@ def _parse_position(obj: dict) -> tuple[float, float]:
     return float(pos.get("first", 0)), float(pos.get("second", 0))
 
 
+def _parse_vector(obj: dict) -> tuple[float, float]:
+    sv = obj.get("speed_vector", {})
+    return float(sv.get("first", 0) or 0), float(sv.get("second", 0) or 0)
+
+
 def _parse_game_state(data: dict) -> ClientGameState:
+    puck = data.get("puck", {})
+    player1 = data.get("player1", {})
+    player2 = data.get("player2", {})
     return ClientGameState(
-        player1=_parse_position(data["player1"]),
-        player2=_parse_position(data["player2"]),
-        puck=_parse_position(data["puck"]),
+        player1=_parse_position(player1),
+        player2=_parse_position(player2),
+        puck=_parse_position(puck),
         score=(int(data["score"]["first"]), int(data["score"]["second"])),
+        puck_speed=float(puck.get("speed", 0) or 0),
+        puck_vector=_parse_vector(puck),
+        player1_speed=float(player1.get("speed", 0) or 0),
+        player1_vector=_parse_vector(player1),
+        player2_speed=float(player2.get("speed", 0) or 0),
+        player2_vector=_parse_vector(player2),
     )
 
 
@@ -49,8 +69,10 @@ class GameClient:
 
         self.connected = False
         self.latest_state: ClientGameState | None = None
+        self.last_score: tuple[int, int] | None = None
         self.status = "Подключение..."
         self._pending_messages: list[str] = []
+        self._state_queue: list[ClientGameState] = []
 
     def start(self) -> None:
         if self._running:
@@ -70,6 +92,8 @@ class GameClient:
         with self._lock:
             self.connected = False
             self.latest_state = None
+            self.last_score = None
+            self._state_queue.clear()
             self.status = "Отключено"
 
     def set_position(self, x: float, y: float) -> None:
@@ -82,15 +106,35 @@ class GameClient:
             self._pending_messages.clear()
             return msgs
 
-    def snapshot(self) -> tuple[bool, ClientGameState | None, str, list[str]]:
-        """Один lock на кадр — меньше подёргиваний от сетевого потока."""
+    def snapshot(self) -> tuple[
+        bool,
+        ClientGameState | None,
+        str,
+        list[str],
+        list[ClientGameState],
+        tuple[int, int] | None,
+    ]:
+        """Один lock на кадр. Возвращает очередь GameState с прошлого кадра (~120/с с сервера)."""
         with self._lock:
             live = self.latest_state
             if live is not None:
-                live = ClientGameState(live.player1, live.player2, live.puck, live.score)
+                live = ClientGameState(
+                    live.player1,
+                    live.player2,
+                    live.puck,
+                    live.score,
+                    live.puck_speed,
+                    live.puck_vector,
+                    live.player1_speed,
+                    live.player1_vector,
+                    live.player2_speed,
+                    live.player2_vector,
+                )
+            states = self._state_queue[:]
+            self._state_queue.clear()
             msgs = self._pending_messages[:]
             self._pending_messages.clear()
-            return self.connected, live, self.status, msgs
+            return self.connected, live, self.status, msgs, states, self.last_score
 
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -112,6 +156,8 @@ class GameClient:
                     with self._lock:
                         self.connected = True
                         self.latest_state = None
+                        self.last_score = None
+                        self._state_queue.clear()
                         self.status = "Ждём второго игрока..."
                     send_task = asyncio.create_task(self._send_loop(ws))
                     try:
@@ -131,16 +177,21 @@ class GameClient:
                 with self._lock:
                     self.connected = False
                     self.latest_state = None
+                    # last_score и очередь GameState не сбрасываем — финальный 5:X успеет обработаться.
                     self.status = "Сервер занят (2 игрока). Перезапустите сервер или закройте лишние окна"
             except OSError:
                 with self._lock:
                     self.connected = False
                     self.latest_state = None
+                    self.last_score = None
+                    self._state_queue.clear()
                     self.status = "Сервер не запущен — см. терминал с uvicorn"
             except Exception as exc:
                 with self._lock:
                     self.connected = False
                     self.latest_state = None
+                    self.last_score = None
+                    self._state_queue.clear()
                     self.status = f"Нет связи с сервером ({exc.__class__.__name__})"
             else:
                 continue
@@ -162,13 +213,18 @@ class GameClient:
         data = packet.get("data")
         with self._lock:
             if msg_type == "GameState" and isinstance(data, dict):
-                self.latest_state = _parse_game_state(data)
+                parsed = _parse_game_state(data)
+                self.latest_state = parsed
+                self.last_score = parsed.score
+                self._state_queue.append(parsed)
                 self.status = "Игра идёт"
             elif msg_type == "Message":
                 text = str(data)
                 self._pending_messages.append(text)
-                if "disconnect" in text.lower() or "max_score" in text.lower():
+                lower = text.lower()
+                if "disconnect" in lower:
                     self.latest_state = None
+                if "max_score" in lower or "game stops" in lower:
                     self.status = text
             elif msg_type == "Error":
                 self._pending_messages.append(f"Ошибка: {data}")
