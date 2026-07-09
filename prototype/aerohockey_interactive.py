@@ -749,7 +749,7 @@ while running:
         state.play_flash_frames -= 1
 
     draw()
-    clock.tick(60)
+    clock.tick(120)
 
 pygame.quit()
 if state.game_client is not None:
